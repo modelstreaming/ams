@@ -12,7 +12,7 @@ For installing the required packages using [Conda](https://conda.io/projects/con
 ```
 git clone https://github.com/modelstreaming/ams.git
 cd ams
-conda env create -f environment.yml -n ams
+conda env create -f environment.yml
 ```
 The current version relies on `tensorflow-v1` for the training and inference purposes. 
 
