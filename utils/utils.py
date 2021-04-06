@@ -232,3 +232,23 @@ def prune(nodes, tag):
         else:
             print('Removed:', n.name)
     return new_nodes
+
+
+def choose_frames(frame_label_list, sample_fraction):
+    """
+    Choose equally-distanced frames based on the number of samples wanted
+
+    :param frame_label_list: A list containing frame-label tuples
+    :type frame_label_list: list of (np.ndarray, np.ndarray)
+    :param sample_fraction: The fraction of samples wanted
+    :type sample_fraction: float
+    :return: list of sample indices
+    :rtype: np.ndarray
+    """
+    samples = int(np.round(sample_fraction * len(frame_label_list)))
+    indices = np.linspace(-1, len(frame_label_list)-1, samples+1, endpoint=True)[1:]
+    indices = np.round(indices).astype(int)
+    assert indices.size == samples, f"indices had {indices.size} values but samples is {samples}"
+    frames_chosen = [frame_label_list[chosen_index][0] for chosen_index in indices]
+    labels_chosen = [frame_label_list[chosen_index][1] for chosen_index in indices]
+    return frames_chosen, labels_chosen

@@ -4,17 +4,14 @@ import numpy as np
 import cv2
 from collections import deque
 import subprocess as sp
-import sys
+from ams.utils.utils import calculate_miou, string_class_iou, choose_frames
+from ams.exp_configs import class_weights, test_length, coco_class_converter, is_coco
+from ams.SemanticNetwork import SemanticNetwork
 
 from termcolor import colored
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import tensorflow as tf
-
-sys.path.append('../../.')
-from ams.utils.utils import calculate_miou, string_class_iou
-from ams.tools.exp_configs import class_weights, test_length
-from ams.tools.SemanticNetwork import SemanticNetwork
 
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
@@ -46,6 +43,9 @@ flags.DEFINE_bool('compress_uplink', False, 'Compress the uplink using H264 enco
 flags.DEFINE_bool('no_restore', False, 'Do not restore the model on every training')
 flags.DEFINE_bool('save_pic', False, 'Save the pictures in inference')
 
+flags.DEFINE_bool('enable_ASR', False, 'Enable Adaptive Sampling Rate')
+flags.DEFINE_bool('enable_ATR', False, 'Enable Adaptive Training Rate')
+
 flags.DEFINE_enum('train_strategy', 'full_model', ['full_model',
                                                    'coord_desc_auto',
                                                    'coord_desc_last',
@@ -70,8 +70,13 @@ flags.DEFINE_integer('early_cutoff_time', 60, 'Where to start making the one-tim
 
 SIZE = [FLAGS.height, FLAGS.height * 2]
 
+assert not flags.enable_ATR or flags.enable_ASR, 'ASR must be enabled for ATR to work'
+assert not flags.enable_ASR or flags.mode == 'simple', 'ASR can only be used in simple mode'
+assert not flags.enable_ATR or flags.mode == 'simple', 'ATR can only be used in simple mode'
 
-def train_model(train_start, train_end, sampling_period, gpu_id, run_label, gt_path, exp_num, save_range):
+
+def train_model(train_start, train_end, sampling_period, gpu_id, run_label, gt_path, exp_num, save_range,
+                sample_send_period):
     """
     This function emulates the training phase of the server-client setting. It collects frames with a rate of
     sampling_period in the range [train_start, train_end). It saves the trained models for time points in save_range
@@ -84,6 +89,7 @@ def train_model(train_start, train_end, sampling_period, gpu_id, run_label, gt_p
     :param gt_path: Where ground truth labels are saved
     :param exp_num: A unique number assigned to each video that can be used to look up it's length and chosen classes
     :param save_range: The points to save the models
+    :param sample_send_period: The period at which samples are sent, in seconds
     :type train_start: int
     :type train_end: int
     :type gpu_id: str
@@ -91,7 +97,8 @@ def train_model(train_start, train_end, sampling_period, gpu_id, run_label, gt_p
     :type run_label: str
     :type gt_path: str
     :type exp_num: int
-    :type save_range: list
+    :type save_range: list of int
+    :type sample_send_period: int
     """
     assert train_end - train_start != 0, "There should be at least one set of data points"
     # Open video, get the fps and set it's starting point to train_start
@@ -104,8 +111,27 @@ def train_model(train_start, train_end, sampling_period, gpu_id, run_label, gt_p
     i = train_start * fps
     cap.set(cv2.CAP_PROP_POS_FRAMES, i)
     # Initialize variables to track down-link bandwidth usage
-    update_size = 0
     update_count = 0
+    send_rate = sampling_period / fps
+    sample_per_period = []
+    up_bw_per_period = []  # in bits
+    down_bw_per_period = []  # in bits
+    frame_label_bucket = []
+    num_unseen_frames = 0
+    # ATR state variables and logs, if ATRis used, save_range changes in the middle of a run and must be saved
+    model_save_times = [0]
+    train_period_reset = save_range[2] - save_range[1]
+    train_period_current = save_range[2] - save_range[1]
+    if flags.enable_ATR:
+        assert train_period_current == flags.train_period
+        for j in range(2, len(save_range)):
+            assert train_period_current == save_range[j] - save_range[j-1]
+    send_rate_deq = deque(maxlen=5)
+    hibernate = False
+    # COCO labels need preprocessing, doesn't do anything if the dataset is not LVS
+    map_coco = None
+    if is_coco(exp_num):
+        map_coco = coco_class_converter()
     # Use deques to keep a finite number of data points, representing a span of FLAGS.memory_len amount of seconds
     frame_memory = deque(maxlen=int(FLAGS.memory_len / sampling_period * fps))
     label_memory = deque(maxlen=int(FLAGS.memory_len / sampling_period * fps))
@@ -122,7 +148,8 @@ def train_model(train_start, train_end, sampling_period, gpu_id, run_label, gt_p
                                        coord_frac=float(FLAGS.coord_fraction),
                                        train_biases_only=False,
                                        regularize=False,
-                                       masked_gradients=FLAGS.train_strategy not in ['full_model'])
+                                       masked_gradients=FLAGS.train_strategy not in ['full_model'],
+                                       cross_miou_compat=flags.enable_ASR)
     # Initially save the model
     save_dir = get_save_dir(run_label + "_%d" % train_start)
     semantic_network.save_to_frozen_graph(save_dir + "_final")
@@ -131,58 +158,103 @@ def train_model(train_start, train_end, sampling_period, gpu_id, run_label, gt_p
     while cap.isOpened() and i < train_end_frame:
         # Read frame from video
         ret, frame = cap.read()
-        if (i + 1) % sampling_period == 0:
-            if ret:
+        if ret:
+            # load corresponding label in gt_path
+            gt = cv2.imread("%sgt_%06d.png" % (gt_path, i), cv2.IMREAD_GRAYSCALE)
+            frame_label_bucket.append((frame, gt))
+        else:
+            print("Premature end of video, exiting")
+            exit(1)
+
+        i += 1
+        if i % (5 * fps) == 0:
+            print_process("%d seconds elapsed" % (i / fps), i / fps)
+
+        if i // fps % sample_send_period == 0:
+            # When it's time to send, choose frames to send based on send_rate
+            frames_chosen, labels_chosen = choose_frames(frame_label_bucket, send_rate)
+            for frame, label in zip(frames_chosen, labels_chosen):
                 if FLAGS.compress_uplink:
                     # If we use compress_uplink, use twice the resolution to send a higher quality
                     frame = cv2.resize(frame, (SIZE[1] * 2, SIZE[0] * 2))
                 else:
                     frame = cv2.resize(frame, (SIZE[1], SIZE[0]))
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            else:
-                print("Premature end of video, exiting")
-                exit(1)
-            to_compress_frame_memory.append(frame)
-            # load corresponding label in gt_path
-            gt = cv2.imread("%sgt_%06d.png" % (gt_path, i), cv2.IMREAD_GRAYSCALE)
-            gt_resized = cv2.resize(gt, (SIZE[1], SIZE[0]), interpolation=cv2.INTER_NEAREST)
-            label_memory.append(gt_resized)
+                label_resized = cv2.resize(label, (SIZE[1], SIZE[0]), interpolation=cv2.INTER_NEAREST)
+                to_compress_frame_memory.append(frame)
+                if map_coco is not None:
+                    label_resized = map_coco[label_resized]
+                label_memory.extend(label_resized)
+            frame_label_bucket.clear()
 
-        i += 1
-        if i % (5 * fps) == 0:
-            print_process("%d seconds elapsed" % (i / fps), i / fps)
+            num_frames = len(to_compress_frame_memory)
+            sample_per_period.append(num_frames)
+            # Log unseen frames to use for computing phi-score in ASR
+            num_unseen_frames += num_frames
 
-        assert len(frame_memory) + len(to_compress_frame_memory) == int((i - train_start * fps) / sampling_period) or \
-            len(frame_memory) == frame_memory.maxlen
-
-        if i / fps in save_range:
             if FLAGS.compress_uplink:
                 # First write frames to video files using FFMPEG, then read frames from that video and append them to
                 # the server's memory
-                num_frames = len(to_compress_frame_memory)
                 output_video_file = f"{get_save_dir(run_label)}_tmp_movie.mp4"
-                with open(os.devnull, "w") as f:
-                    proc = sp.Popen(
-                        ['ffmpeg',
-                         '-y',
-                         '-s', '1024x512',
-                         '-pixel_format', 'bgr24',
-                         '-f', 'rawvideo',
-                         '-r', '30',
-                         '-i', 'pipe:',
-                         '-vcodec', 'libx264',
-                         '-pix_fmt', 'yuv420p',
-                         '-crf', '20',
-                         f'{output_video_file}'],
-                        stdin=sp.PIPE, stderr=f, stdout=f)
-                    while len(to_compress_frame_memory) > 0:
-                        f = to_compress_frame_memory.popleft()
-                        proc.stdin.write(f.tobytes())
-                    proc.stdin.close()
-                    proc.wait()
-                    proc.terminate()
+                time_start_encode = time.time()
+                trying = True
+                while trying:
+                    # If multiple runs are initiated, their input pipes can compete, so we add a while loop to keep
+                    # trying until succeeded
+                    try:
+                        with open(os.devnull, "w") as f:
+                            proc = sp.Popen(
+                                ['/usr/bin/ffmpeg',
+                                 '-y',
+                                 '-s', '1024x512',
+                                 '-pixel_format', 'bgr24',
+                                 '-f', 'rawvideo',
+                                 '-r', '10',
+                                 '-i', 'pipe:',
+                                 '-vcodec', 'libx264',
+                                 '-pix_fmt', 'yuv420p',
+                                 '-preset', 'medium',
+                                 '-b:v', '%dk' % (FLAGS.uplink_bw * sample_send_period),
+                                 '-pass', '1',
+                                 '-f', 'mp4',
+                                 '/dev/null'],
+                                stdin=sp.PIPE, stderr=f, stdout=f)
+                            for index_vi_frame in range(len(to_compress_frame_memory)):
+                                frame_to_pipe = to_compress_frame_memory[index_vi_frame]
+                                proc.stdin.write(frame_to_pipe.tobytes())
+                            proc.stdin.close()
+                            proc.wait()
+                            proc.terminate()
+                            proc = sp.Popen(
+                                ['/usr/bin/ffmpeg',
+                                 '-y',
+                                 '-s', '1024x512',
+                                 '-pixel_format', 'bgr24',
+                                 '-f', 'rawvideo',
+                                 '-r', '10',
+                                 '-i', 'pipe:',
+                                 '-vcodec', 'libx264',
+                                 '-pix_fmt', 'yuv420p',
+                                 '-preset', 'medium',
+                                 '-b:v', '%dk' % (FLAGS.uplink_bw * sample_send_period),
+                                 '-pass', '2',
+                                 f'{output_video_file}'],
+                                stdin=sp.PIPE, stderr=f, stdout=f)
+                            for index_vi_frame in range(len(to_compress_frame_memory)):
+                                frame_to_pipe = to_compress_frame_memory[index_vi_frame]
+                                proc.stdin.write(frame_to_pipe.tobytes())
+                            proc.stdin.close()
+                            proc.wait()
+                            proc.terminate()
+                            trying = False
+                    except BrokenPipeError:
+                        print_process("GOT BROKEN PIPE, TRYING AGAIN", i // fps)
+                        continue
+                to_compress_frame_memory.clear()
+                print("FFMPEG took %.1f ms to encode" % ((time.time() - time_start_encode) * 1000))
                 size_vid = os.path.getsize(output_video_file) / 1024
                 print_process("Video is %.2fKB, %.2fKb per frame" % (size_vid, size_vid / num_frames * 8), i / fps)
+                up_bw_per_period.append(size_vid * 8)
                 comp_cap = cv2.VideoCapture(output_video_file)
                 comp_ret = True
                 while comp_ret:
@@ -193,9 +265,47 @@ def train_model(train_start, train_end, sampling_period, gpu_id, run_label, gt_p
                         frame_memory.append(dec_frame)
                 os.remove(output_video_file)
             else:
+                output_image_file = f"{get_save_dir(run_label)}_tmp_image.png"
+                size_images = 0
                 while len(to_compress_frame_memory) > 0:
                     f = to_compress_frame_memory.popleft()
+                    cv2.imwrite(output_image_file, f)
+                    size_images += os.path.getsize(output_image_file) / 1024
                     frame_memory.append(f)
+                up_bw_per_period.append(size_images * 8)
+                os.remove(output_image_file)
+
+        if i // fps in save_range:
+            if flags.enable_ASR:
+                # Compute phi-score based on unseen frames and change send_rate
+                i_start = max(0, len(label_memory) - num_unseen_frames - 1)
+                miou_cross_arr_ = []
+                for k in range(i_start, len(label_memory) - 1):
+                    _, _, miou_cross_ = semantic_network.calc_cross_miou(
+                        np.array([label_memory[k], label_memory[k + 1]]))
+                    miou_cross_arr_.append(miou_cross_)
+                send_rate = send_rate - 0.2 * np.tanh((np.mean(miou_cross_arr_) - 0.6) * 20)
+                send_rate = np.clip(send_rate, 0.1, 1)
+                print_process("Send rate updated to %.2f" % send_rate, i / fps)
+                num_unseen_frames = 0
+
+            if FLAGS.enable_ATR:
+                # Enable or disable hibernation based on phi-score history
+                if np.mean(list(send_rate_deq)) < 0.25:
+                    hibernate = True
+                if np.mean(list(send_rate_deq)) > 0.35 and hibernate:
+                    hibernate = False
+                    train_period_current = train_period_reset
+                    print_process(f"Train period reset to {train_period_reset}", i/fps)
+                if hibernate:
+                    train_period_current = min(train_period_current+2, 6 * train_period_reset)
+                    print_process(f"Train period updated to {train_period_current}", i/fps)
+                # Change the next training times based on train_period_current
+                index_now_save_range = save_range.index(i // fps)
+                save_range = save_range[:index_now_save_range]
+                save_range.extend([save_time for save_time in range(i//fps, train_end, train_period_current)])
+                assert i // fps in save_range
+
             if not FLAGS.no_restore:
                 semantic_network.restore_initial()
             t1 = time.time()
@@ -204,37 +314,47 @@ def train_model(train_start, train_end, sampling_period, gpu_id, run_label, gt_p
             whole_params = 0
             # Calculate the down-link bandwidth
             with open(save_dir + '_mask.dat', 'wb') as f:
+                full_size = 0
                 for val in semantic_network.curr_mask:
                     val_reshape = val.flatten()
                     whole_params += val_reshape.size
                     val_reshape = np.packbits(val_reshape)
                     f.write(val_reshape.tobytes())
+                    full_size += val.size
                 for p_ind in range(len(semantic_network.train_params)):
                     assert semantic_network.train_params[p_ind].shape == semantic_network.curr_mask[p_ind].shape
                     write_params = \
                         semantic_network.train_params[p_ind][semantic_network.curr_mask[p_ind]].astype(np.float16)
                     f.write(write_params.tobytes())
+            # Experimental method: Add params to gzip as well, instead of sending changed params
+            # if bw usage is worse switch to the version used for the paper
             sp.Popen(['gzip', '-9', '-f', '-k', save_dir + '_mask.dat']).wait()
+            print("Full size of model is %d" % full_size)
             curr_update = os.path.getsize(save_dir + '_mask.dat.gz') * 8
-            update_size += curr_update
+            down_bw_per_period.append(curr_update)
             update_count += 1
             print("Using %.1fKbps for updating params" % (curr_update // 1024))
             # Save the model
             save_dir = get_save_dir(run_label + f"_{i // fps}")
             semantic_network.save_to_frozen_graph(save_dir + "_final")
             print_process("Saved model to %s_final.pb" % save_dir, i / fps)
+            model_save_times.append(i / fps)
 
     semantic_network.close_model()
-    # Write down-link bandwidth stats
-    with open(get_save_dir(run_label + "_results") + '_update.txt', 'w') as f:
+    final_save_dir = get_save_dir(run_label + "_results")
+    np.save(final_save_dir + '_fps_client.npy', sample_per_period)
+    np.save(final_save_dir + '_bw_uplink.npy', up_bw_per_period)
+    np.save(final_save_dir + '_bw_downlink.npy', down_bw_per_period)
+    np.save(final_save_dir + '_model_update_times.npy', model_save_times)
+    # Write bandwidth stats
+    with open(final_save_dir + '_update.txt', 'w') as f:
         interval = train_end - train_start
-        # A little hack to avoid the corner case
         if update_count == 0:
-            assert update_size == 0
-            update_count = 1
-        f.write("%d\n%d\n%d\n%d\n%d\n%d" % (update_size, update_size // 1024,
-                                            update_size / update_count, update_size / update_count // 1024,
-                                            update_size / interval, update_size / interval // 1024))
+            assert len(down_bw_per_period) == 0
+        downlink_size = sum(down_bw_per_period)
+        uplink_size = sum(up_bw_per_period)
+        samples_sent = sum(sample_per_period)
+        f.write("%d\n%d\n%d\n%d\n%d" % (downlink_size, uplink_size, update_count, interval, samples_sent))
     cap.release()
     frame_memory.clear()
     label_memory.clear()
@@ -431,8 +551,13 @@ def plot_miou_mean(period, sampling_period, run_label):
     :type sampling_period: int
     :type run_label: str
     """
+    final_save_dir = get_save_dir(run_label + "_results")
+    with open(final_save_dir + '_update.txt', 'r') as f:
+        downlink_size, uplink_size, update_count, interval, samples_sent = [k.rstrip('\n') for k in f.readlines()]
     miou_s = np.load('%s_mioumems.npy' % get_save_dir(run_label + "_results"))
     print(f'({period}, {sampling_period}, {np.mean(miou_s[7500:]) * 100})')
+    print(f'Uplink: {uplink_size / interval / 1024}, Downlink: {downlink_size / interval / 1024}, Sampling rate: '
+          f'{samples_sent / interval}, Update rate: {update_count / interval}')
 
 
 def get_save_dir(prepend):
@@ -467,11 +592,16 @@ def main():
 
     if FLAGS.mode == 'simple':
         run_label = "%d__%d_tp%d_f%d" % (0, test_length(vid_num), FLAGS.train_period, FLAGS.send_period)
-        event_list = [i for i in range(0, test_length(vid_num), FLAGS.train_period)
-                      if i == 0 or i >= FLAGS.memory_len or not FLAGS.initial_fill]
+        event_list = [0]
+        first_train = np.ceil(100 / FLAGS.train_period) * FLAGS.train_period
+        event_list.extend([i for i in range(first_train, test_length(vid_num), FLAGS.train_period)
+                           if i == 0 or i >= FLAGS.memory_len or not FLAGS.initial_fill])
         if not FLAGS.only_results:
             train_model(0, test_length(vid_num), FLAGS.send_period, FLAGS.gpu,
-                        run_label, FLAGS.gt_video, vid_num, event_list)
+                        run_label, FLAGS.gt_video, vid_num, event_list, FLAGS.train_period)
+            if flags.enable_ATR:
+                # When ATR is enabled event_list can change, so load it
+                event_list = np.load(get_save_dir(run_label + "_results") + '_model_update_times.npy').tolist()
             infer_output(0, test_length(vid_num), FLAGS.gpu,
                          run_label, FLAGS.gt_video, vid_num, event_list)
 
@@ -487,7 +617,7 @@ def main():
         if not FLAGS.only_results:
             # Get pretrained data
             run_label = "pretrained"
-            train_model(0, 1, FLAGS.send_period, FLAGS.gpu, run_label, FLAGS.gt_video, vid_num, [0])
+            train_model(0, 1, FLAGS.send_period, FLAGS.gpu, run_label, FLAGS.gt_video, vid_num, [0], FLAGS.train_period)
             infer_output(0, test_length(vid_num), FLAGS.gpu, run_label, FLAGS.gt_video, vid_num, [0])
             done = 0
             total = number_of_points * len(k1s)
@@ -497,7 +627,8 @@ def main():
                 for k1 in k1s:
                     run_label = "%d__%d__%d_f%d" % (t - k1, t, t + k2, FLAGS.send_period)
                     print("t: %d, k1: %d" % (t, k1))
-                    train_model(t - k1, t, FLAGS.send_period, FLAGS.gpu, run_label, FLAGS.gt_video, vid_num, [t])
+                    train_model(t - k1, t, FLAGS.send_period, FLAGS.gpu, run_label, FLAGS.gt_video, vid_num, [t],
+                                FLAGS.train_period)
                     infer_output(t, t + k2, FLAGS.gpu, run_label, FLAGS.gt_video, vid_num, [t])
                     done += 1
                     time_to_finish = (time.time() - time_start) / done * (total - done)
@@ -515,13 +646,13 @@ def main():
         event_list = [0, FLAGS.early_cutoff_time]
         if not FLAGS.only_results:
             train_model(0, FLAGS.early_cutoff_time, FLAGS.send_period, FLAGS.gpu, run_label, FLAGS.gt_video, vid_num,
-                        event_list)
+                        event_list, FLAGS.train_period)
             infer_output(0, test_length(vid_num), FLAGS.gpu, run_label, FLAGS.gt_video, vid_num, event_list)
 
         plot_miou_mean(-1, FLAGS.send_period, run_label)
     elif FLAGS.mode == 'pretrained':
         run_label = "pretrained"
-        train_model(0, 1, FLAGS.send_period, FLAGS.gpu, run_label, FLAGS.gt_video, vid_num, [0])
+        train_model(0, 1, FLAGS.send_period, FLAGS.gpu, run_label, FLAGS.gt_video, vid_num, [0], FLAGS.train_period)
         infer_output(0, test_length(vid_num), FLAGS.gpu, run_label, FLAGS.gt_video, vid_num, [0])
         plot_miou_mean(-1, -1, run_label)
 

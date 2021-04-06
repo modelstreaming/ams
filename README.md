@@ -22,7 +22,18 @@ For running the code, use:
 conda activate ams
 python run.py --help
 ```
+## Extracting labels
+To speed up experiments, we first extract teacher inferred labels from video frames and save them for future use. 
+We define each video by a number (`VIDEO_NUM`) and a name (`VIDEO_NAME`). 
+Together they are used to ID a video (e.g `12` and `la`, `12-la.mp4`) and 
+load meta information such as video length and class labels (from `exp_configs.py`). 
+Videos from the four datasets described below have already been added. 
 
+Finally, to extract the labels, use this command:
+```
+python ams/extract_labels.py --input_video PATH_TO_VIDEO/VIDEO_NUM-VIDEO_NAME.mp4 --dump_path PATH_TO_GT/VIDEO_NUM-VIDEO_NAME/ 
+--teacher_checkpoint PATH_TO_TEACHER_MODEL
+```
 ## Models & Checkpoints
 ### Student
 For lightweight (student) models we use DeeplabV3 with MobileNetV2 backbone. We use official pretrained checkpoints released in Deeplab's github repo [here](https://github.com/tensorflow/models/tree/master/research/deeplab/g3doc/model_zoo.md). For compatibilty with `TF1` and our code, you may directly use the following checkpoints:

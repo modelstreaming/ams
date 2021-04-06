@@ -1,10 +1,13 @@
 import os
 import threading
 import time
+
 import numpy as np
+import sys
 import cv2
 from collections import deque
-import sys
+
+from termcolor import colored
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import tensorflow as tf
@@ -27,7 +30,8 @@ class SemanticNetwork(object):
     BLACK = np.array([0, 0, 0], dtype=np.uint8)
 
     def __init__(self, meta_dir, class_weights_exp=None, height=None, gpu_id='0', frozen=False,
-                 scale=None, mini_batch_size=None, lr=None, mem_frac=1, coord_frac=0.1, **kwargs):
+                 scale=None, mini_batch_size=None, lr=None, mem_frac=1, coord_frac=0.1, cross_miou_compat=False,
+                 filter_out=None, over_ride_total_classes=None, **kwargs):
         assert height is not None, "No height is given"
         assert class_weights_exp is not None, "No class weights specified"
         assert frozen or None not in [scale, mini_batch_size, lr], "Training parameters must be specified for " \
@@ -35,6 +39,9 @@ class SemanticNetwork(object):
         self.lr = lr
         self.mini_batch_size = mini_batch_size
         self.scale = scale
+        if over_ride_total_classes is not None:
+            print(colored('Overriding default number of classes', 'cyan'))
+            self.TOTAL_CLASSES = over_ride_total_classes
 
         self.coord_frac = coord_frac
 
@@ -44,6 +51,8 @@ class SemanticNetwork(object):
         self.class_count = len(self.class_indices_graph)
         assert self.class_indices_graph.shape == (self.class_count,)
         assert self.class_count > 0
+
+        self.cross_miou_compat = cross_miou_compat
 
         self.color_map_reduced_ = np.take(colormap(), self.class_indices_graph, axis=0)
         self.take_array = np.cumsum(self.class_weights_graph).reshape(
@@ -112,6 +121,23 @@ class SemanticNetwork(object):
                 self.student = create_student_v3(meta_dir, class_weights=class_weights_exp, **kwargs)
                 self.saver = SaveHelper(graph=self.student['graph'], map_fun=lambda x: x)
                 with self.student['graph'].as_default():
+                    if cross_miou_compat:
+                        self.labels_after = tf.placeholder(tf.int32, [None, None])
+                        labels_after_one_hot = tf.one_hot(self.labels_after, self.TOTAL_CLASSES, axis=-1)
+                        labels_after_one_hot_reduced = tf.gather(labels_after_one_hot, self.class_indices_graph, axis=-1)
+                        labels_after_reduced = tf.argmax(labels_after_one_hot_reduced, axis=-1, output_type=tf.int32)
+                        self.labels_before = tf.placeholder(tf.int32, [None, None])
+                        labels_before_one_hot = tf.one_hot(self.labels_before, self.TOTAL_CLASSES, axis=-1)
+                        labels_before_one_hot_reduced = tf.gather(labels_before_one_hot, self.class_indices_graph, axis=-1)
+                        labels_before_reduced = tf.argmax(labels_before_one_hot_reduced, axis=-1, output_type=tf.int32)
+                        weights = tf.reduce_max(labels_before_one_hot_reduced, axis=-1) * \
+                                  tf.reduce_max(labels_after_one_hot_reduced, axis=-1)
+                        self.cross_mean_iou, self.cross_update_op = tf.metrics.mean_iou(
+                            labels=labels_before_reduced,
+                            predictions=labels_after_reduced,
+                            num_classes=self.class_count,
+                            weights=weights)
+
                     miou_list_vars = [v for v in tf.local_variables() if any(tag in v.name for tag in
                                                                              ['confusion', 'miou', 'mean_iou'])]
                     self.reset_conf_mat = tf.variables_initializer(miou_list_vars)
@@ -123,9 +149,12 @@ class SemanticNetwork(object):
             self.sess = tf.Session(graph=self.student['graph'], config=self.config)
             self.sess.run([init, self.reset_conf_mat])
 
+            if filter_out is not None:
+                self.OPT_FILTER.extend(filter_out)
             self.filter = lambda elem: elem if all(
                 keyword not in elem for keyword in self.OPT_FILTER) and elem not in self.OP_FILTER else None
             self.saver.restore_vars(self.sess, "%s.npy" % self.meta_dir, self.filter)
+            self.mask = None
 
         print("Semantic Network is ready!!!")
 
@@ -134,6 +163,9 @@ class SemanticNetwork(object):
 
     def restore(self, chk):
         self.saver.restore_vars(self.sess, chk, self.filter)
+
+    def get_vars(self):
+        return self.saver.save_vars(self.sess, self.save_vars, lambda x: x)
 
     def predict_input(self, frames):
         self.process_lock.acquire()
@@ -148,6 +180,18 @@ class SemanticNetwork(object):
         assert labels_.shape == frames.shape[:-1]
         self.process_lock.release()
         return labels_
+
+    def calc_cross_miou(self, labels):
+        assert not self.frozen or self.cross_miou_compat
+        assert labels.shape == (2, self.height, 2 * self.height)
+        self.process_lock.acquire()
+        self.sess.run(self.reset_conf_mat)
+        conf_mat_ = self.sess.run(self.cross_update_op, feed_dict={self.labels_before: labels[0],
+                                                                   self.labels_after: labels[1]})
+        iou_ = calculate_miou(conf_mat_, nan=True)
+        miou_ = np.nanmean(iou_)
+        self.process_lock.release()
+        return conf_mat_, iou_, miou_
 
     def predict_with_metric(self, frames, labels_teacher):
         self.process_lock.acquire()
@@ -168,8 +212,11 @@ class SemanticNetwork(object):
         self.process_lock.release()
         return labels_student, conf_mat_, iou_, miou_, loss_
 
-    def train_with_deque(self, frame_deque, label_deque, num_of_iterations, train_strategy='full_model'):
+    def train_with_deque(self, frame_deque, label_deque, num_of_iterations, train_strategy='full_model',
+                         keep_mask=False):
         assert not self.frozen, "Can't train frozen graph!!!"
+        if not keep_mask:
+            self.mask = None
         self.process_lock.acquire()
         batch_deque = deque()
         batch_thr = threading.Thread(target=self._fill_batch, args=(batch_deque, frame_deque, label_deque,
@@ -203,32 +250,7 @@ class SemanticNetwork(object):
             t1 = time.time()
 
             # Construct the feed_dict
-            feed_dict = {}
-            feed_dict[self.student['learning_rate']] = self.lr
-            if train_strategy == 'coord_desc_auto':
-                if it == 1:
-                    # Update the train_mask
-                    _after = self.saver.save_vars(self.sess, self.save_vars, self.filter)
-                    changes = []
-                    for k in self.student['grad_masks_pl']:
-                        changes.append(np.reshape(np.abs(_after[k] - _before[k]), (-1,)))
-                    changes = np.concatenate(changes, axis=0)
-                    cut_threshold = np.percentile(changes, 100 * (1 - self.coord_frac))
-                    numvars_list = []
-                    train_vars_len = 0
-                    all_vars = 0
-                    _combine = {}
-                    for var_name in self.student['grad_masks_pl']:
-                        train_mask_[self.student['grad_masks_pl'][var_name]] = np.abs(
-                            _after[var_name] - _before[var_name]) > cut_threshold
-                        train_vars_len += np.sum(train_mask_[self.student['grad_masks_pl'][var_name]])
-                        all_vars += train_mask_[self.student['grad_masks_pl'][var_name]].size
-                        numvars_list.append(np.sum(train_mask_[self.student['grad_masks_pl'][var_name]]))
-                        _combine[var_name] = np.where(train_mask_[self.student['grad_masks_pl'][var_name]],
-                                                      _after[var_name], _before[var_name])
-                        assert _combine[var_name].shape == _before[var_name].shape
-                    print("Using auto mode, Training %.3f%% of variables" % (100 * train_vars_len / all_vars))
-                    self.saver.restore_vars(self.sess, _combine, self.filter)
+            feed_dict = {self.student['learning_rate']: self.lr}
 
             if 'coord_desc_' in train_strategy:
                 for k in train_mask_:
@@ -237,6 +259,33 @@ class SemanticNetwork(object):
             # Call for execution
             results = self.sess.run(iteration_update_ops, feed_dict=feed_dict)
             print('Loss is %.3f at iteration %d and took %.1f ms' % (results['loss'], it, (time.time() - t1) * 1000.0))
+
+            if train_strategy == 'coord_desc_auto':
+                if it == 0 and self.mask is None:
+                    # Update the train_mask
+                    _after = self.saver.save_vars(self.sess, self.save_vars, self.filter)
+                    changes = []
+                    for k in self.student['grad_masks_pl']:
+                        changes.append(np.reshape(np.abs(_after[k] - _before[k]), (-1,)))
+                    changes = np.concatenate(changes, axis=0)
+                    cut_threshold = np.percentile(changes, 100*(1-self.coord_frac))
+                    numvars_list = []
+                    train_vars_len = 0
+                    all_vars = 0
+                    _combine = {}
+                    for var_name in self.student['grad_masks_pl']:
+                        train_mask_[self.student['grad_masks_pl'][var_name]] = np.abs(
+                            _after[var_name] - _before[var_name]) > cut_threshold
+
+                        train_vars_len += np.sum(train_mask_[self.student['grad_masks_pl'][var_name]])
+                        all_vars += train_mask_[self.student['grad_masks_pl'][var_name]].size
+                        numvars_list.append(np.sum(train_mask_[self.student['grad_masks_pl'][var_name]]))
+                        _combine[var_name] = np.where(train_mask_[self.student['grad_masks_pl'][var_name]],
+                                                      _after[var_name], _before[var_name])
+                        assert _combine[var_name].shape == _before[var_name].shape
+                    print("Using auto mode, Training %.3f%% of variables" % (100 * train_vars_len / all_vars))
+                    self.saver.restore_vars(self.sess, _combine, self.filter)
+                    self.mask = train_mask_
 
         if 'coord_desc_' in train_strategy:
             self.curr_mask = [train_mask_[self.student['grad_masks_pl'][var_name]]
@@ -253,8 +302,11 @@ class SemanticNetwork(object):
     def get_train_mask(self, train_strategy):
         if train_strategy == 'coord_desc_auto':
             _before = self.saver.save_vars(self.sess, self.save_vars, self.filter)
-            train_mask_ = {self.student['grad_masks_pl'][var_name]: np.ones(_before[var_name].shape, dtype=np.bool) for
-                           var_name in self.student['grad_masks_pl']}
+            if self.mask is None:
+                train_mask_ = {self.student['grad_masks_pl'][var_name]: np.ones(_before[var_name].shape, dtype=np.bool)
+                               for var_name in self.student['grad_masks_pl']}
+            else:
+                train_mask_ = self.mask
         elif train_strategy == 'coord_desc_last' and self.coord_frac == 0.1:
             _before = self.saver.save_vars(self.sess, self.save_vars, self.filter)
             train_mask_ = {self.student['grad_masks_pl'][var_name]: np.zeros(_before[var_name].shape, dtype=np.bool)
@@ -539,18 +591,81 @@ class SemanticNetwork(object):
                         np.bool)
             all_vars, train_vars_len = self.train_vars_count(train_mask_)
             print("Using both20 mode, Training %.3f%% of variables" % (100 * train_vars_len / all_vars))
+        elif train_strategy == 'coord_desc_last' and self.coord_frac == 0.02:
+            _before = self.saver.save_vars(self.sess, self.save_vars, self.filter)
+            train_mask_ = {self.student['grad_masks_pl'][var_name]: np.zeros(_before[var_name].shape, dtype=np.bool)
+                           for var_name in self.student['grad_masks_pl']}
+            for key in self.student['grad_masks_pl']:
+                if any(keyword in key for keyword in ['logits/semantic/',
+                                                      'concat_projection/BatchNorm/']):
+                    train_mask_[self.student['grad_masks_pl'][key]] = np.ones(_before[key].shape, dtype=np.bool)
+                elif key == 'concat_projection/weights:0':
+                    train_mask_[self.student['grad_masks_pl'][key]] = np.random.choice([True, False],
+                                                                                       size=_before[key].shape,
+                                                                                       p=[0.7187, 0.2813]).astype(
+                        np.bool)
+            all_vars, train_vars_len = self.train_vars_count(train_mask_)
+            print("Using last2 mode, Training %.3f%% of variables" % (100 * train_vars_len / all_vars))
+        elif train_strategy == 'coord_desc_first' and self.coord_frac == 0.02:
+            _before = self.saver.save_vars(self.sess, self.save_vars, self.filter)
+            train_mask_ = {self.student['grad_masks_pl'][var_name]: np.zeros(_before[var_name].shape, dtype=np.bool)
+                           for var_name in self.student['grad_masks_pl']}
+            for key in self.student['grad_masks_pl']:
+                if any(keyword in key for keyword in ['/Conv/',
+                                                      '/expanded_conv/',
+                                                      '/expanded_conv_1/',
+                                                      '/expanded_conv_2/',
+                                                      '/expanded_conv_3/',
+                                                      '/expanded_conv_4/']):
+                    train_mask_[self.student['grad_masks_pl'][key]] = np.ones(_before[key].shape, dtype=np.bool)
+                elif key == 'MobilenetV2/expanded_conv_5/expand/weights:0':
+                    train_mask_[self.student['grad_masks_pl'][key]] = np.random.choice([True, False],
+                                                                                       size=_before[key].shape,
+                                                                                       p=[0.7367, 0.2633]).astype(
+                        np.bool)
+            all_vars, train_vars_len = self.train_vars_count(train_mask_)
+            print("Using first2 mode, Training %.3f%% of variables" % (100 * train_vars_len / all_vars))
+        elif train_strategy == 'coord_desc_both' and self.coord_frac == 0.02:
+            _before = self.saver.save_vars(self.sess, self.save_vars, self.filter)
+            train_mask_ = {self.student['grad_masks_pl'][var_name]: np.zeros(_before[var_name].shape, dtype=np.bool)
+                           for var_name in self.student['grad_masks_pl']}
+            for key in self.student['grad_masks_pl']:
+                if any(keyword in key for keyword in ['/Conv/',
+                                                      '/expanded_conv/',
+                                                      '/expanded_conv_1/',
+                                                      '/expanded_conv_2/',
+                                                      '/expanded_conv_3/depthwise/',
+                                                      '/expanded_conv_3/expand/',
+                                                      'logits/semantic/',
+                                                      'concat_projection/BatchNorm/']):
+                    train_mask_[self.student['grad_masks_pl'][key]] = np.ones(_before[key].shape, dtype=np.bool)
+                elif key == 'MobilenetV2/expanded_conv_3/project/weights:0':
+                    train_mask_[self.student['grad_masks_pl'][key]] = np.random.choice([True, False],
+                                                                                       size=_before[key].shape,
+                                                                                       p=[0.00217, 0.99783]).astype(
+                        np.bool)
+                elif key == 'concat_projection/weights:0':
+                    train_mask_[self.student['grad_masks_pl'][key]] = np.random.choice([True, False],
+                                                                                       size=_before[key].shape,
+                                                                                       p=[0.12005, 0.87995]).astype(
+                        np.bool)
+            all_vars, train_vars_len = self.train_vars_count(train_mask_)
+            print("Using both2 mode, Training %.3f%% of variables" % (100 * train_vars_len / all_vars))
         elif train_strategy == 'coord_desc_rand':
             _before = self.saver.save_vars(self.sess, self.save_vars, self.filter)
             train_mask_ = {
                 self.student['grad_masks_pl'][var_name]: np.random.choice([True, False], size=_before[var_name].shape,
                                                                           p=[self.coord_frac,
-                                                                             1 - self.coord_frac]).astype(np.bool)
+                                                                             1-self.coord_frac]).astype(np.bool)
                 for var_name in self.student['grad_masks_pl']}
             all_vars, train_vars_len = self.train_vars_count(train_mask_)
             print("Using rand mode, Training %.3f%% of variables" % (100 * train_vars_len / all_vars))
-        elif 'full_model':
+        elif train_strategy == 'full_model':
             _before = None
             train_mask_ = None
+        else:
+            raise NameError('train_strategy %s is not implemented.' % train_strategy)
+
         return _before, train_mask_
 
     def train_vars_count(self, train_mask_):
