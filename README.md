@@ -31,8 +31,8 @@ Videos from the four datasets described below have already been added.
 
 Finally, to extract the labels, use this command:
 ```
-python ams/extract_labels.py --input_video PATH_TO_VIDEO/VIDEO_NUM-VIDEO_NAME.mp4 --dump_path PATH_TO_GT/VIDEO_NUM-VIDEO_NAME/ 
---teacher_checkpoint PATH_TO_TEACHER_MODEL
+python ams/extract_labels.py --input_video PATH_TO_VIDEO/VIDEO_NUM-VIDEO_NAME.mp4 
+--dump_path PATH_TO_GT/VIDEO_NUM-VIDEO_NAME/ --teacher_checkpoint PATH_TO_TEACHER_MODEL
 ```
 ## Models & Checkpoints
 ### Student
