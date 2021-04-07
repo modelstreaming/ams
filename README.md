@@ -42,7 +42,7 @@ For lightweight (student) models we use DeeplabV3 with MobileNetV2 backbone. We 
 
 ### Teacher
 For the teacher model, we use DeeplabV3 with Xception65 backbone for Outdoor Scenes, Cityscapes, and A2D2 datasets. For a compatible teacher checkpoint, use:
-- [DeeplabV3 with Xception65 backbone pretrained on Cityscapes](./checkpoints/deeplabv3_xception65_cityscapes)
+- [DeeplabV3 with Xception65 backbone pretrained on Cityscapes](https://drive.google.com/drive/folders/1w0O_FTRUM3rWmeMVm9C_iLqjr1QD21xW?usp=sharing)
 
 For the LVS dataset, we follow Mullapedi et al. [3] in using Mask R-CNN as the teacher and directly use the teacher labels they provide.
 
