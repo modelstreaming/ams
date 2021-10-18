@@ -5,6 +5,7 @@
 - [Running AMS](#running-ams)
 - [Models & Checkpoints](#models-&-checkpoints)
 - [Datasets](#datasets)
+- [Citation](#citation)
 - [References](#references)
 
 ## Installation
@@ -68,6 +69,18 @@ We use the entire video sequence of front center cameras at [Gaimersheim](https:
 
 ### LVS
 For downloading the Long Videos Dataset (LVS) [1], you may check [here](http://graphics.cs.cmu.edu/projects/lvsdataset/).
+
+## Citation
+You can cite this work using:
+```
+@inproceedings{khani2021real,
+  title={Real-Time Video Inference on Edge Devices via Adaptive Model Streaming},
+  author={Khani, Mehrdad and Hamadanian, Pouya and Nasr-Esfahany, Arash and Alizadeh, Mohammad},
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  pages={4572--4582},
+  year={2021}
+}
+```
 
 ## References
 1. Cordts, M., Omran, M., Ramos, S., Rehfeld, T., Enzweiler, M., Benenson, R., Franke, U., Roth, S. and Schiele, B., 2016. The cityscapes dataset for semantic urban scene understanding. In Proceedings of the IEEE conference on computer vision and pattern recognition (pp. 3213-3223).
